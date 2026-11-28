@@ -1,3 +1,4 @@
+/** Exercise the chat and REST endpoints against isolated, file-backed task lists. */
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -6,18 +7,24 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import type { ChatMessage } from "../shared/chat.ts";
+import { reply } from "./agent.ts";
 import { createApp } from "./app.ts";
-import { createJsonTaskStore } from "./task-store.ts";
+import { createJsonTaskStore, type TaskStore } from "./task-store.ts";
 
-async function startTestApp(t: TestContext) {
+/** Start a local HTTP server, optionally running the agent with a scripted model. */
+async function startTestApp(t: TestContext, interpret?: Parameters<typeof reply>[2]) {
   const directory = await mkdtemp(join(tmpdir(), "todo-agent-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const filename = join(directory, "tasks.json");
   const conversations: ChatMessage[][] = [];
+  const tasks = createJsonTaskStore(filename);
   const app = createApp({
-    tasks: createJsonTaskStore(filename),
+    tasks,
     async reply(messages) {
       conversations.push(messages);
+
+      if (interpret) return reply(messages, tasks, interpret);
+
       return "收到";
     },
   });
@@ -27,6 +34,7 @@ async function startTestApp(t: TestContext) {
   await once(server, "listening");
   const { port } = server.address() as AddressInfo;
 
+  /** Send JSON over HTTP and capture the status and decoded response. */
   async function request(method: string, path: string, body?: unknown) {
     const response = await fetch(`http://127.0.0.1:${port}${path}`, {
       method,
@@ -95,4 +103,176 @@ test("聊天 API 只将有效的完整对话传给智能体，并返回其回复
   const invalid = await request("POST", "/api/chat", { messages: messages.slice(0, 2) });
   assert.equal(invalid.status, 400);
   assert.deepEqual(conversations, [messages]);
+});
+
+test("README 六轮对话通过聊天接口更新同一份持久化清单", async (t) => {
+  const history: ChatMessage[] = [];
+  let modelDecision: unknown;
+  const { request, filename } = await startTestApp(t, async (messages) => {
+    assert.deepEqual(messages, history);
+
+    return JSON.stringify(modelDecision);
+  });
+
+  /** Carry the actual assistant answer into the next turn, as the browser does. */
+  async function chat(content: string, decision: unknown): Promise<string> {
+    modelDecision = decision;
+    history.push({ role: "user", content });
+    const response = await request("POST", "/api/chat", { messages: history });
+
+    assert.equal(response.status, 200);
+    history.push({ role: "assistant", content: response.body.reply });
+
+    return response.body.reply;
+  }
+
+  /** Inspect the same records through the public task endpoint after each turn. */
+  async function listTasks(): Promise<ReturnType<TaskStore["list"]>> {
+    const response = await request("GET", "/api/tasks");
+
+    assert.equal(response.status, 200);
+
+    return response.body;
+  }
+
+  assert.equal(
+    await chat("帮我记一下买牛奶", { action: "create", title: "买牛奶" }),
+    "已添加「买牛奶」。",
+  );
+  const firstList = await listTasks();
+  const [milkTask] = firstList;
+  assert.deepEqual(firstList, [{ id: milkTask.id, title: "买牛奶", done: false }]);
+
+  assert.equal(
+    await chat("再记一条取快递", { action: "create", title: "取快递" }),
+    "已添加「取快递」。",
+  );
+  const bothPending = await listTasks();
+  const parcelTask = bothPending[1];
+  assert.deepEqual(bothPending, [milkTask, { id: parcelTask.id, title: "取快递", done: false }]);
+
+  assert.equal(
+    await chat("我有哪些任务？", { action: "list", filter: "all" }),
+    "待办：\n· 买牛奶\n· 取快递",
+  );
+  assert.deepEqual(await listTasks(), bothPending);
+
+  assert.equal(
+    await chat("牛奶买好了", { action: "complete", id: milkTask.id }),
+    "已完成「买牛奶」。",
+  );
+  const completedMilk = { ...milkTask, done: true };
+  assert.deepEqual(await listTasks(), [completedMilk, parcelTask]);
+
+  assert.equal(
+    await chat("取快递这条删掉吧", { action: "delete", id: parcelTask.id }),
+    "已删除「取快递」。",
+  );
+  assert.deepEqual(await listTasks(), [completedMilk]);
+
+  assert.equal(
+    await chat("再给我看看清单", { action: "list", filter: "all" }),
+    "已完成：\n· 买牛奶",
+  );
+  assert.deepEqual(await listTasks(), [completedMilk]);
+  assert.deepEqual(createJsonTaskStore(filename).list(), [completedMilk]);
+});
+
+test("先澄清歧义，再根据用户的回答完成对应任务", async (t) => {
+  const question = "你取的是公司快递，还是家里快递？";
+  const { request } = await startTestApp(t, async (messages, snapshot) => {
+    if (messages.length === 1) return JSON.stringify({ action: "clarify", question });
+
+    assert.deepEqual(messages.slice(1), [
+      { role: "assistant", content: question },
+      { role: "user", content: "家里那个" },
+    ]);
+    const homeParcel = snapshot.find((task) => task.title === "取家里快递");
+    assert.ok(homeParcel);
+
+    return JSON.stringify({ action: "complete", id: homeParcel.id });
+  });
+  const office = (await request("POST", "/api/tasks", { title: "取公司快递" })).body;
+  const home = (await request("POST", "/api/tasks", { title: "取家里快递" })).body;
+  const messages: ChatMessage[] = [{ role: "user", content: "快递取好了" }];
+
+  const clarification = await request("POST", "/api/chat", { messages });
+  assert.deepEqual(clarification, { status: 200, body: { reply: question } });
+  assert.deepEqual((await request("GET", "/api/tasks")).body, [office, home]);
+
+  messages.push(
+    { role: "assistant", content: clarification.body.reply },
+    { role: "user", content: "家里那个" },
+  );
+  assert.deepEqual(await request("POST", "/api/chat", { messages }), {
+    status: 200,
+    body: { reply: "已完成「取家里快递」。" },
+  });
+  assert.deepEqual((await request("GET", "/api/tasks")).body, [office, { ...home, done: true }]);
+});
+
+test("无效决策、未知 ID 和在模型返回前被改名的任务都不会触发删除", async (t) => {
+  let modelOutput = "";
+  let renameBeforeReply = false;
+  const { request, filename } = await startTestApp(t, async () => {
+    if (renameBeforeReply) {
+      const store = createJsonTaskStore(filename);
+      const [task] = store.list();
+      store.update(task.id, { title: "买面包" });
+    }
+
+    return modelOutput;
+  });
+
+  const original = (await request("POST", "/api/tasks", { title: "买牛奶" })).body;
+  const body = { messages: [{ role: "user", content: "把买牛奶删掉" }] };
+
+  for (const invalid of [
+    "invalid JSON",
+    '{"action":"create","title":" "}',
+    JSON.stringify({ action: "delete", id: original.id, extra: true }),
+    '{"action":"delete","id":"missing"}',
+  ]) {
+    modelOutput = invalid;
+    const result = await request("POST", "/api/chat", body);
+
+    assert.equal(result.status, 200);
+    assert.doesNotMatch(result.body.reply, /已删除|已添加/);
+    assert.deepEqual((await request("GET", "/api/tasks")).body, [original]);
+  }
+
+  modelOutput = JSON.stringify({ action: "delete", id: original.id });
+  renameBeforeReply = true;
+  const stale = await request("POST", "/api/chat", body);
+
+  assert.match(stale.body.reply, /确认/);
+  assert.deepEqual((await request("GET", "/api/tasks")).body, [{ ...original, title: "买面包" }]);
+});
+
+test("清单按状态筛选，重复完成一条任务时保留原有记录", async (t) => {
+  let decision: unknown = { action: "list", filter: "pending" };
+  const { request } = await startTestApp(t, async () => JSON.stringify(decision));
+
+  /** Exercise a fresh chat turn against the current REST-visible records. */
+  async function ask(content: string): Promise<string> {
+    const result = await request("POST", "/api/chat", { messages: [{ role: "user", content }] });
+    assert.equal(result.status, 200);
+
+    return result.body.reply;
+  }
+
+  assert.equal(await ask("还有什么要做？"), "目前没有待办任务。");
+  const milk = (await request("POST", "/api/tasks", { title: "买牛奶" })).body;
+  const parcel = (await request("POST", "/api/tasks", { title: "取快递" })).body;
+  await request("PATCH", `/api/tasks/${milk.id}`, { done: true });
+
+  assert.equal(await ask("还有什么要做？"), "待办：\n· 取快递");
+  decision = { action: "list", filter: "done" };
+  assert.equal(await ask("哪些做完了？"), "已完成：\n· 买牛奶");
+  decision = { action: "list", filter: "all" };
+  assert.equal(await ask("看看清单"), "待办：\n· 取快递\n\n已完成：\n· 买牛奶");
+
+  decision = { action: "complete", id: milk.id };
+  assert.equal(await ask("牛奶买好了"), "「买牛奶」已经完成了。");
+  assert.deepEqual((await request("GET", "/api/tasks")).body, [{ ...milk, done: true }, parcel]);
 });
