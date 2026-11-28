@@ -66,3 +66,7 @@ npm run build
 ```
 
 测试使用独立的临时目录。要预览构建产物，先停止开发服务，再运行 `npm start` 并打开同一地址。
+
+## 持续集成
+
+推送到 `main` 或向 `main` 提交拉取请求时，GitHub Actions 会在 Node.js 24 上安装锁定的依赖，运行测试、类型检查和 lint，检查 `server`、`shared` 和 `src` 的代码格式，最后构建前端。测试使用模拟模型，无需配置 DeepSeek 密钥。具体命令见 [CI 工作流](.github/workflows/ci.yml)。
