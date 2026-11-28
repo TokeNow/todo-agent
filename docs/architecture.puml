@@ -1,0 +1,45 @@
+@startuml
+title Xiaoming | Proposed task agent
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam backgroundColor white
+skinparam defaultFontName SansSerif
+
+actor "User" as User
+package "Browser" {
+  component "Chat UI\nApp + ChatHistory" as UI
+  component "Chat client\nchat-client.ts" as Client
+}
+package "Local Node.js server" {
+  component "Startup wiring\nindex.ts" as Startup #FFF0C2
+  component "HTTP entry point\napp.ts" as App
+  component "Task REST router\ntasks.ts" as Rest
+  component "Chat agent\nagent.ts" as Agent #FFF0C2
+  component "Model client\nmodel.ts" as Model
+  component "JSON task store\ntask-store.ts" as Store
+}
+component "Chat contract\nshared/chat.ts" as Contract
+cloud "DeepSeek API" as DeepSeek
+file "data/tasks.json" as Disk
+
+User --> UI : sends and reads Chinese
+UI --> Client : sends conversation
+Client --> App : POST /api/chat\nreceives reply or error
+Client ..> Contract : message type
+App ..> Contract : request validation
+Startup ..> App : supplies reply and store
+Startup ..> Agent : binds shared store
+App --> Agent : reply(messages)
+App --> Rest : /api/tasks routes
+Agent --> Model : messages + saved tasks
+Model --> DeepSeek : HTTPS request\nreturns decision data
+Agent --> Store : list, create, update, remove
+Rest --> Store : same operations
+Store --> Disk : read / replace file
+
+legend bottom
+  Amber = module requiring implementation or wiring
+  Solid arrow = runtime interaction
+  Dotted arrow = contract dependency or startup wiring
+endlegend
+@enduml
