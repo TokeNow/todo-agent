@@ -1,5 +1,5 @@
 @startuml
-title Xiaoming | Proposed task agent
+title Xiaoming | Task agent and due dates
 skinparam componentStyle rectangle
 skinparam shadowing false
 skinparam backgroundColor white
@@ -11,10 +11,11 @@ package "Browser" {
   component "Chat client\nchat-client.ts" as Client
 }
 package "Local Node.js server" {
-  component "Startup wiring\nindex.ts" as Startup #FFF0C2
+  component "Startup wiring\nindex.ts" as Startup
   component "HTTP entry point\napp.ts" as App
   component "Task REST router\ntasks.ts" as Rest
-  component "Chat agent\nagent.ts" as Agent #FFF0C2
+  component "Chat agent\nagent.ts" as Agent
+  component "Hong Kong calendar dates\ndue-date.ts" as Dates
   component "Model client\nmodel.ts" as Model
   component "JSON task store\ntask-store.ts" as Store
 }
@@ -31,14 +32,16 @@ Startup ..> App : supplies reply and store
 Startup ..> Agent : binds shared store
 App --> Agent : reply(messages)
 App --> Rest : /api/tasks routes
-Agent --> Model : messages + saved tasks
+Agent --> Model : messages + tasks + local date
 Model --> DeepSeek : HTTPS request\nreturns decision data
 Agent --> Store : list, create, update, remove
 Rest --> Store : same operations
+Agent --> Dates : resolve deadlines
+Rest ..> Dates : validate input date
+Store ..> Dates : validate saved date
 Store --> Disk : read / replace file
 
 legend bottom
-  Amber = module requiring implementation or wiring
   Solid arrow = runtime interaction
   Dotted arrow = contract dependency or startup wiring
 endlegend
