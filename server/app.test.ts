@@ -12,7 +12,11 @@ import { createApp } from "./app.ts";
 import { createJsonTaskStore, type TaskStore } from "./task-store.ts";
 
 /** Start a local HTTP server, optionally running the agent with a scripted model. */
-async function startTestApp(t: TestContext, interpret?: Parameters<typeof reply>[2]) {
+async function startTestApp(
+  t: TestContext,
+  interpret?: Parameters<typeof reply>[2],
+  turnStartedAt?: Date,
+) {
   const directory = await mkdtemp(join(tmpdir(), "todo-agent-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const filename = join(directory, "tasks.json");
@@ -23,7 +27,7 @@ async function startTestApp(t: TestContext, interpret?: Parameters<typeof reply>
     async reply(messages) {
       conversations.push(messages);
 
-      if (interpret) return reply(messages, tasks, interpret);
+      if (interpret) return reply(messages, tasks, interpret, turnStartedAt);
 
       return "收到";
     },
@@ -275,4 +279,98 @@ test("清单按状态筛选，重复完成一条任务时保留原有记录", as
   decision = { action: "complete", id: milk.id };
   assert.equal(await ask("牛奶买好了"), "「买牛奶」已经完成了。");
   assert.deepEqual((await request("GET", "/api/tasks")).body, [{ ...milk, done: true }, parcel]);
+});
+
+test("Due dates use the Hong Kong turn date and intersect with the requested status", async (t) => {
+  const justAfterMidnight = new Date("2026-12-31T16:05:00Z");
+  let decision: unknown;
+  const { request, filename } = await startTestApp(
+    t,
+    async (_messages, _tasks, today) => {
+      assert.equal(today, "2027-01-01");
+
+      return JSON.stringify(decision);
+    },
+    justAfterMidnight,
+  );
+
+  /** Run an interpreted turn through the same HTTP entry point as the browser. */
+  async function chat(content: string, modelDecision: unknown): Promise<string> {
+    decision = modelDecision;
+    const result = await request("POST", "/api/chat", { messages: [{ role: "user", content }] });
+    assert.equal(result.status, 200);
+
+    return result.body.reply;
+  }
+
+  const legacy = { id: "legacy", title: "散步", done: false };
+  await writeFile(filename, JSON.stringify([legacy]));
+
+  for (const [title, reference, expected] of [
+    ["交报告", "today", "2027-01-01"],
+    ["修电脑", "yesterday", "2026-12-31"],
+    ["还书", "tomorrow", "2027-01-02"],
+    ["寄信", "2027-01-01", "2027-01-01"],
+  ]) {
+    const answer = await chat(title, { action: "create", title, dueDate: reference });
+    assert.ok(answer.includes(expected));
+  }
+
+  const saved = createJsonTaskStore(filename).list();
+  assert.deepEqual(
+    saved.map((task) => task.dueDate),
+    [undefined, "2027-01-01", "2026-12-31", "2027-01-02", "2027-01-01"],
+  );
+  const letter = saved[4];
+  await chat("信寄好了", { action: "complete", id: letter.id });
+
+  assert.equal(
+    await chat("今天有哪些任务到期？", { action: "list", dueDate: "today", filter: "pending" }),
+    "待办：\n· 交报告",
+  );
+  assert.equal(
+    await chat("今天到期的哪些已完成？", { action: "list", dueDate: "today", filter: "done" }),
+    "已完成：\n· 寄信",
+  );
+  assert.equal(
+    await chat("昨天有哪些任务到期？", { action: "list", dueDate: "yesterday", filter: "all" }),
+    "待办：\n· 修电脑",
+  );
+  assert.equal(
+    await chat("明天有哪些任务到期？", { action: "list", dueDate: "tomorrow", filter: "all" }),
+    "待办：\n· 还书",
+  );
+
+  await chat("报告交好了", { action: "complete", id: saved[1].id });
+  assert.equal(
+    await chat("今天有哪些任务到期？", { action: "list", dueDate: "today", filter: "pending" }),
+    "今天没有待办任务到期。",
+  );
+  const reopened = createJsonTaskStore(filename).list();
+  assert.deepEqual(reopened[0], legacy);
+  assert.deepEqual(reopened[4], { ...letter, done: true });
+});
+
+test("REST and chat reject invalid deadlines and preserve valid leap days", async (t) => {
+  const { request } = await startTestApp(t, async () =>
+    JSON.stringify({
+      action: "create",
+      title: "交报告",
+      dueDate: "2026-02-30",
+    }),
+  );
+
+  for (const invalid of ["2026-02-30", "2027-02-29", "2026-2-1", "today", null]) {
+    const response = await request("POST", "/api/tasks", { title: "交报告", dueDate: invalid });
+    assert.equal(response.status, 400);
+  }
+
+  await request("POST", "/api/chat", { messages: [{ role: "user", content: "2月30日交报告" }] });
+  assert.deepEqual((await request("GET", "/api/tasks")).body, []);
+
+  const leapDay = await request("POST", "/api/tasks", { title: "交报告", dueDate: "2028-02-29" });
+  assert.equal(leapDay.status, 201);
+  assert.equal(leapDay.body.dueDate, "2028-02-29");
+  const updated = await request("PATCH", "/api/tasks/" + leapDay.body.id, { done: true });
+  assert.deepEqual(updated.body, { ...leapDay.body, done: true });
 });
